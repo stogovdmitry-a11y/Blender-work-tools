@@ -7,10 +7,10 @@ a source vertex is within the distance.
 import bpy
 import bmesh
 import numpy as np
-from bpy.props import FloatProperty, PointerProperty, StringProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, PointerProperty, StringProperty
 from mathutils.kdtree import KDTree
 
-from .seam_normals import TransferError, transfer_seam_normals
+from .seam_normals import MODE_ITEMS, OBJECT_OT_toggle_split_normals, TransferError, transfer_seam_normals
 
 
 class SnapVertexError(Exception):
@@ -121,28 +121,117 @@ def snap_vertices(source, target, distance):
 class SnapVertexSettings(bpy.types.PropertyGroup):
     source: PointerProperty(
         name="Source",
-        description="Mesh whose vertices are the snap targets. If empty, the other selected mesh is used",
+        description="Mesh used for both the snap and the normal transfer. If empty, the other selected mesh is used",
         type=bpy.types.Object,
         poll=_poll_mesh_object,
     )
     distance: FloatProperty(
         name="Distance",
-        description="Maximum world distance. Selected vertices farther than this stay where they are",
+        description="Maximum world distance for the snap and for the normal transfer",
         default=0.01,
         min=0.0,
         soft_max=1.0,
         precision=4,
         subtype="DISTANCE",
     )
+    both: BoolProperty(
+        name="Snap and Transfer",
+        description="Snap the selected vertices, then transfer normals from the same source. Either button does both",
+        default=True,
+    )
+    mode: EnumProperty(
+        name="Affect",
+        description="Which target vertices receive normals",
+        items=MODE_ITEMS,
+        default="SELECTED",
+    )
+    vertex_group: StringProperty(
+        name="Group",
+        description="Vertex group on the target",
+    )
+    interpolate: BoolProperty(
+        name="Interpolate Along Boundary",
+        description="Sample the nearest open edge on the source. Use this when the new seam has more vertices",
+        default=False,
+    )
+
+
+def _load_settings(operator, context):
+    settings = context.scene.work_tools_snap_vertices
+    operator.distance = settings.distance
+    operator.do_both = bool(settings.both)
+    operator.mode = settings.mode
+    operator.vertex_group = settings.vertex_group
+    operator.interpolate = settings.interpolate
+    operator.source_name = settings.source.name if settings.source else ""
+
+
+def _run_snap_seams(operator, context, action):
+    target = context.active_object
+    previous_mode = target.mode
+    if previous_mode == "EDIT":
+        bpy.ops.object.mode_set(mode="OBJECT")
+    snapped = None
+    snap_missed = 0
+    result = None
+    try:
+        source = _resolve_source(context, operator.source_name, target)
+        if action == "SNAP" or operator.do_both:
+            snapped, snap_missed = snap_vertices(source, target, operator.distance)
+            context.view_layer.update()
+        if action == "TRANSFER" or operator.do_both:
+            result = transfer_seam_normals(
+                context,
+                source,
+                target,
+                distance=operator.distance,
+                mode=operator.mode,
+                vertex_group=operator.vertex_group,
+                interpolate=operator.interpolate,
+            )
+    except SnapVertexError as exc:
+        operator.report({"WARNING"}, str(exc))
+        return {"CANCELLED"}
+    except TransferError as exc:
+        if snapped is not None:
+            operator.report({"WARNING"}, f"Snapped vertices: {snapped} of {snapped + snap_missed}. {exc}")
+            return {"FINISHED"}
+        operator.report({"WARNING"}, str(exc))
+        return {"CANCELLED"}
+    finally:
+        if previous_mode == "EDIT" and context.active_object is not None and context.active_object.mode != "EDIT":
+            bpy.ops.object.mode_set(mode="EDIT")
+
+    parts = []
+    warning = False
+    if snapped is not None:
+        parts.append(f"Snapped vertices: {snapped} of {snapped + snap_missed}")
+        warning = bool(snap_missed)
+    if result is not None:
+        parts.append(f"Transferred normals: {result.matched} of {result.matched + result.missed}")
+        if result.notes:
+            parts.append(". ".join(result.notes))
+        warning = warning or bool(result.missed or result.notes)
+    nothing_moved = snapped in (None, 0)
+    nothing_transferred = result is None or result.matched == 0
+    if nothing_moved and nothing_transferred:
+        operator.report({"WARNING"}, "No vertex fell within the distance")
+        return {"CANCELLED"}
+    operator.report({"WARNING"} if warning else {"INFO"}, ". ".join(parts))
+    return {"FINISHED"}
 
 
 class OBJECT_OT_snap_vertices(bpy.types.Operator):
     bl_idname = "object.snap_vertices"
-    bl_label = "Snap Vertices"
+    bl_label = "Snap"
     bl_description = "Move selected vertices of the active mesh onto the nearest vertices of the source"
     bl_options = {"REGISTER", "UNDO"}
 
     distance: FloatProperty(name="Distance", default=0.01, min=0.0, soft_max=1.0, precision=4, subtype="DISTANCE")
+    do_both: BoolProperty(name="Snap and Transfer", default=True)
+    mode: EnumProperty(name="Affect", items=MODE_ITEMS, default="SELECTED")
+    vertex_group: StringProperty(name="Group")
+    interpolate: BoolProperty(name="Interpolate Along Boundary", default=False)
     source_name: StringProperty(options={"HIDDEN"})
 
     @classmethod
@@ -151,94 +240,65 @@ class OBJECT_OT_snap_vertices(bpy.types.Operator):
         return obj is not None and obj.type == "MESH" and context.mode in {"OBJECT", "EDIT_MESH"}
 
     def invoke(self, context, event):
-        settings = context.scene.work_tools_snap_vertices
-        self.distance = settings.distance
-        self.source_name = settings.source.name if settings.source else ""
+        _load_settings(self, context)
         return self.execute(context)
 
     def execute(self, context):
-        target = context.active_object
-        try:
-            source = _resolve_source(context, self.source_name, target)
-            snapped, missed = snap_vertices(source, target, self.distance)
-        except SnapVertexError as exc:
-            self.report({"WARNING"}, str(exc))
-            return {"CANCELLED"}
-        if snapped == 0:
-            self.report({"WARNING"}, "No vertex fell within the distance")
-            return {"CANCELLED"}
-        message = f"Snapped vertices: {snapped} of {snapped + missed}"
-        self.report({"WARNING"} if missed else {"INFO"}, message)
-        return {"FINISHED"}
+        return _run_snap_seams(self, context, "SNAP")
 
 
-class OBJECT_OT_snap_vertices_and_normals(bpy.types.Operator):
-    bl_idname = "object.snap_vertices_and_normals"
-    bl_label = "Snap and Transfer Normals"
-    bl_description = "Snap the selected vertices, then copy normals from the source onto those same vertices"
+class OBJECT_OT_transfer_seam_normals(bpy.types.Operator):
+    bl_idname = "object.transfer_seam_normals"
+    bl_label = "Transfer"
+    bl_description = "Copy normals from the source onto the active mesh"
     bl_options = {"REGISTER", "UNDO"}
 
     distance: FloatProperty(name="Distance", default=0.01, min=0.0, soft_max=1.0, precision=4, subtype="DISTANCE")
+    do_both: BoolProperty(name="Snap and Transfer", default=True)
+    mode: EnumProperty(name="Affect", items=MODE_ITEMS, default="SELECTED")
+    vertex_group: StringProperty(name="Group")
+    interpolate: BoolProperty(name="Interpolate Along Boundary", default=False)
     source_name: StringProperty(options={"HIDDEN"})
 
     @classmethod
     def poll(cls, context):
         obj = context.active_object
-        return obj is not None and obj.type == "MESH" and context.mode in {"OBJECT", "EDIT_MESH"}
+        if obj is None or obj.type != "MESH":
+            return False
+        settings = getattr(context.scene, "work_tools_snap_vertices", None)
+        if settings is not None and settings.both:
+            return context.mode in {"OBJECT", "EDIT_MESH"}
+        return context.mode == "OBJECT"
 
     def invoke(self, context, event):
-        settings = context.scene.work_tools_snap_vertices
-        self.distance = settings.distance
-        self.source_name = settings.source.name if settings.source else ""
+        _load_settings(self, context)
         return self.execute(context)
 
     def execute(self, context):
-        target = context.active_object
-        previous_mode = target.mode
-        if previous_mode == "EDIT":
-            bpy.ops.object.mode_set(mode="OBJECT")
-        try:
-            source = _resolve_source(context, self.source_name, target)
-            snapped, snap_missed = snap_vertices(source, target, self.distance)
-            context.view_layer.update()
-            try:
-                result = transfer_seam_normals(
-                    context,
-                    source,
-                    target,
-                    distance=self.distance,
-                    mode="SELECTED",
-                    interpolate=False,
-                )
-            except TransferError as exc:
-                self.report({"WARNING"}, f"Snapped vertices: {snapped} of {snapped + snap_missed}. {exc}")
-                return {"FINISHED"}
-        except (SnapVertexError, TransferError) as exc:
-            self.report({"WARNING"}, str(exc))
-            return {"CANCELLED"}
-        finally:
-            if previous_mode == "EDIT" and context.active_object is not None and context.active_object.mode != "EDIT":
-                bpy.ops.object.mode_set(mode="EDIT")
-        if snapped == 0 and result.matched == 0:
-            self.report({"WARNING"}, "No vertex fell within the distance")
-            return {"CANCELLED"}
-        message = (
-            f"Snapped vertices: {snapped} of {snapped + snap_missed}. "
-            f"Transferred normals: {result.matched} of {result.matched + result.missed}"
-        )
-        self.report({"WARNING"} if snap_missed or result.missed or result.notes else {"INFO"}, message)
-        return {"FINISHED"}
+        return _run_snap_seams(self, context, "TRANSFER")
 
 
-class VIEW3D_PT_snap_vertices(bpy.types.Panel):
-    bl_label = "Snap Vertices"
-    bl_idname = "VIEW3D_PT_snap_vertices"
+class VIEW3D_PT_snap_seams(bpy.types.Panel):
+    bl_label = "Snap Seams"
+    bl_idname = "VIEW3D_PT_snap_seams"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "Work Tools"
 
     def draw(self, context):
         layout = self.layout
+        overlay = context.space_data.overlay
+        row = layout.row(align=True)
+        row.operator(
+            OBJECT_OT_toggle_split_normals.bl_idname,
+            icon="NORMALS_VERTEX_FACE",
+            depress=overlay.show_split_normals,
+        )
+        if overlay.use_normals_constant_screen_size:
+            row.prop(overlay, "normals_constant_screen_size", text="Length")
+        else:
+            row.prop(overlay, "normals_length", text="Length")
+
         if context.mode not in {"OBJECT", "EDIT_MESH"}:
             layout.label(text="Object Mode or Edit Mode is required")
             return
@@ -251,21 +311,26 @@ class VIEW3D_PT_snap_vertices(bpy.types.Panel):
             col.label(text="Target is the active mesh")
         col.prop(settings, "source")
         col.prop(settings, "distance")
+        col.prop(settings, "mode")
+        if settings.mode == "GROUP" and target is not None and target.type == "MESH":
+            col.prop_search(settings, "vertex_group", target, "vertex_groups", text="Group")
+        col.prop(settings, "interpolate")
         col.separator()
+        col.prop(settings, "both")
         col.operator(OBJECT_OT_snap_vertices.bl_idname, icon="SNAP_VERTEX")
-        col.operator(OBJECT_OT_snap_vertices_and_normals.bl_idname, icon="NORMALS_VERTEX")
+        col.operator(OBJECT_OT_transfer_seam_normals.bl_idname, icon="NORMALS_VERTEX")
 
 
 def draw_object_menu(layout):
     layout.operator(OBJECT_OT_snap_vertices.bl_idname, icon="SNAP_VERTEX")
-    layout.operator(OBJECT_OT_snap_vertices_and_normals.bl_idname, icon="NORMALS_VERTEX")
+    layout.operator(OBJECT_OT_transfer_seam_normals.bl_idname, icon="NORMALS_VERTEX")
 
 
 _CLASSES = (
     SnapVertexSettings,
     OBJECT_OT_snap_vertices,
-    OBJECT_OT_snap_vertices_and_normals,
-    VIEW3D_PT_snap_vertices,
+    OBJECT_OT_transfer_seam_normals,
+    VIEW3D_PT_snap_seams,
 )
 
 

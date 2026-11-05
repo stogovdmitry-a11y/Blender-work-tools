@@ -7,7 +7,7 @@ the menu below. Panels go in the Work Tools sidebar tab.
 bl_info = {
     "name": "Work Tools",
     "author": "",
-    "version": (1, 3, 1),
+    "version": (1, 4, 0),
     "blender": (4, 5, 0),
     "location": "View3D > Sidebar > Work Tools",
     "description": "A set of working tools for Blender",
@@ -33,7 +33,6 @@ class VIEW3D_MT_work_tools(Menu):
 
     def draw(self, _context):
         layout = self.layout
-        seam_normals.draw_object_menu(layout)
         send_to_maya.draw_object_menu(layout)
         snap_uvs.draw_object_menu(layout)
         snap_vertices.draw_object_menu(layout)

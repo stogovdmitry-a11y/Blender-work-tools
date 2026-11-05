@@ -1,21 +1,12 @@
 """Transfer seam normals from one mesh to another by proximity.
 
-Object Mode. The active mesh is the target. The source is chosen in the
-panel, or taken as the other selected mesh.
-
+Snap Seams calls this in Object Mode. The active mesh is the target.
 Vertex selection is whatever was left from the last Edit Mode session.
 It stays selected when you return to Object Mode.
 """
 
 import bpy
 import numpy as np
-from bpy.props import (
-    BoolProperty,
-    EnumProperty,
-    FloatProperty,
-    PointerProperty,
-    StringProperty,
-)
 from mathutils.kdtree import KDTree
 
 MODE_ITEMS = (
@@ -340,120 +331,6 @@ def transfer_seam_normals(context, source, target, *, distance, mode, vertex_gro
     return TransferResult(int(write_mask.sum()), missed, notes)
 
 
-def _poll_mesh_object(self, obj):
-    return obj.type == "MESH"
-
-
-def _resolve_source(context, source_name, target):
-    if source_name:
-        source = bpy.data.objects.get(source_name)
-        if source is None or source.type != "MESH":
-            raise TransferError("Source not found")
-        return source
-    others = [obj for obj in context.selected_objects if obj.type == "MESH" and obj != target]
-    if len(others) == 1:
-        return others[0]
-    raise TransferError("Set a source in the panel, or select exactly two meshes")
-
-
-class TransferSeamNormalsSettings(bpy.types.PropertyGroup):
-    source: PointerProperty(
-        name="Source",
-        description="Mesh to copy normals from. If empty, the other selected mesh is used",
-        type=bpy.types.Object,
-        poll=_poll_mesh_object,
-    )
-    distance: FloatProperty(
-        name="Distance",
-        description="Maximum world distance between a target vertex and its match on the source",
-        default=0.001,
-        min=0.0,
-        soft_max=1.0,
-        precision=4,
-        subtype="DISTANCE",
-    )
-    mode: EnumProperty(
-        name="Affect",
-        description="Which target vertices to change",
-        items=MODE_ITEMS,
-        default="SELECTED",
-    )
-    vertex_group: StringProperty(
-        name="Group",
-        description="Vertex group on the target",
-    )
-    interpolate: BoolProperty(
-        name="Interpolate Along Boundary",
-        description="Sample the nearest open edge on the source. Use this when the new seam has more vertices",
-        default=False,
-    )
-
-
-class OBJECT_OT_transfer_seam_normals(bpy.types.Operator):
-    bl_idname = "object.transfer_seam_normals"
-    bl_label = "Transfer Seam Normals"
-    bl_description = "Copy normals from the source onto the seam vertices of the active mesh"
-    bl_options = {"REGISTER", "UNDO"}
-
-    distance: FloatProperty(
-        name="Distance",
-        default=0.001,
-        min=0.0,
-        soft_max=1.0,
-        precision=4,
-        subtype="DISTANCE",
-    )
-    mode: EnumProperty(name="Affect", items=MODE_ITEMS, default="SELECTED")
-    vertex_group: StringProperty(name="Group")
-    interpolate: BoolProperty(name="Interpolate Along Boundary", default=False)
-    source_name: StringProperty(options={"HIDDEN"})
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return obj is not None and obj.type == "MESH" and context.mode == "OBJECT"
-
-    def invoke(self, context, event):
-        settings = context.scene.work_tools_seam_normals
-        self.distance = settings.distance
-        self.mode = settings.mode
-        self.vertex_group = settings.vertex_group
-        self.interpolate = settings.interpolate
-        self.source_name = settings.source.name if settings.source else ""
-        return self.execute(context)
-
-    def execute(self, context):
-        target = context.active_object
-        try:
-            source = _resolve_source(context, self.source_name, target)
-            result = transfer_seam_normals(
-                context,
-                source,
-                target,
-                distance=self.distance,
-                mode=self.mode,
-                vertex_group=self.vertex_group,
-                interpolate=self.interpolate,
-            )
-        except TransferError as exc:
-            self.report({"WARNING"}, str(exc))
-            return {"CANCELLED"}
-
-        if result.matched == 0:
-            message = "No vertex fell within the distance"
-            if result.notes:
-                message = f"{message}. {'. '.join(result.notes)}"
-            self.report({"WARNING"}, message)
-            return {"CANCELLED"}
-
-        message = f"Transferred vertices: {result.matched} of {result.matched + result.missed}"
-        if result.notes:
-            message = f"{message}. {'. '.join(result.notes)}"
-        level = "WARNING" if result.missed or result.notes else "INFO"
-        self.report({level}, message)
-        return {"FINISHED"}
-
-
 class OBJECT_OT_toggle_split_normals(bpy.types.Operator):
     bl_idname = "object.toggle_split_normals"
     bl_label = "Split Normals"
@@ -475,66 +352,16 @@ class OBJECT_OT_toggle_split_normals(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class VIEW3D_PT_transfer_seam_normals(bpy.types.Panel):
-    bl_label = "Seam Normals"
-    bl_idname = "VIEW3D_PT_transfer_seam_normals"
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "Work Tools"
-
-    def draw(self, context):
-        layout = self.layout
-        overlay = context.space_data.overlay
-        row = layout.row(align=True)
-        row.operator(
-            OBJECT_OT_toggle_split_normals.bl_idname,
-            icon="NORMALS_VERTEX_FACE",
-            depress=overlay.show_split_normals,
-        )
-        if overlay.use_normals_constant_screen_size:
-            row.prop(overlay, "normals_constant_screen_size", text="Length")
-        else:
-            row.prop(overlay, "normals_length", text="Length")
-        if context.mode != "OBJECT":
-            layout.label(text="Object Mode is required")
-            return
-
-        settings = context.scene.work_tools_seam_normals
-        target = context.active_object
-        col = layout.column(align=True)
-        if target is not None and target.type == "MESH":
-            col.label(text=f"Target: {target.name}")
-        else:
-            col.label(text="Target is the active mesh")
-        col.prop(settings, "source")
-        col.prop(settings, "distance")
-        col.prop(settings, "mode")
-        if settings.mode == "GROUP" and target is not None and target.type == "MESH":
-            col.prop_search(settings, "vertex_group", target, "vertex_groups", text="Group")
-        col.prop(settings, "interpolate")
-        col.separator()
-        col.operator(OBJECT_OT_transfer_seam_normals.bl_idname, icon="NORMALS_VERTEX")
-
-
-def draw_object_menu(layout):
-    layout.operator(OBJECT_OT_transfer_seam_normals.bl_idname, icon="NORMALS_VERTEX")
-
-
 _CLASSES = (
-    TransferSeamNormalsSettings,
-    OBJECT_OT_transfer_seam_normals,
     OBJECT_OT_toggle_split_normals,
-    VIEW3D_PT_transfer_seam_normals,
 )
 
 
 def register():
     for cls in _CLASSES:
         bpy.utils.register_class(cls)
-    bpy.types.Scene.work_tools_seam_normals = PointerProperty(type=TransferSeamNormalsSettings)
 
 
 def unregister():
-    del bpy.types.Scene.work_tools_seam_normals
     for cls in reversed(_CLASSES):
         bpy.utils.unregister_class(cls)
