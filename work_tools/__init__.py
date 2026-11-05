@@ -1,7 +1,7 @@
-"""Work Tools — набор рабочих инструментов для Blender.
+"""Work Tools, a set of working tools for Blender.
 
-Новый инструмент — отдельный модуль со своими register/unregister,
-плюс пункт в меню ниже. Панели кладутся во вкладку N-панели «Work Tools».
+A new tool is its own module with register and unregister, plus an entry in
+the menu below. Panels go in the Work Tools sidebar tab.
 """
 
 bl_info = {
@@ -10,7 +10,7 @@ bl_info = {
     "version": (1, 0, 0),
     "blender": (4, 5, 0),
     "location": "View3D > Sidebar > Work Tools",
-    "description": "Набор рабочих инструментов",
+    "description": "A set of working tools for Blender",
     "category": "3D View",
 }
 

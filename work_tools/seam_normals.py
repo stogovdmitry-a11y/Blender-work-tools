@@ -1,10 +1,10 @@
-"""Перенос нормалей шва с одного меша на другой по близости.
+"""Transfer seam normals from one mesh to another by proximity.
 
-Object Mode. Активный меш — цель. Источник выбирается в панели
-или берётся как второй выделенный меш.
+Object Mode. The active mesh is the target. The source is chosen in the
+panel, or taken as the other selected mesh.
 
-Выделение вершин — то, что осталось после последнего Edit Mode.
-В Object Mode оно сохраняется.
+Vertex selection is whatever was left from the last Edit Mode session.
+It stays selected when you return to Object Mode.
 """
 
 import bpy
@@ -19,9 +19,9 @@ from bpy.props import (
 from mathutils.kdtree import KDTree
 
 MODE_ITEMS = (
-    ("SELECTED", "Выделенные", "Вершины, выделенные в последнем Edit Mode"),
-    ("BOUNDARY", "Граница", "Вершины на открытых рёбрах, если рядом есть источник"),
-    ("GROUP", "Группа", "Вершины с ненулевым весом в группе"),
+    ("SELECTED", "Selected", "Vertices selected in the last Edit Mode session"),
+    ("BOUNDARY", "Boundary", "Vertices on open edges, when a source vertex is nearby"),
+    ("GROUP", "Vertex Group", "Vertices with a non-zero weight in the group"),
 )
 
 _EXACT = 1e-8
@@ -60,7 +60,7 @@ def _normalize_rows(vectors):
 def _linear_matrix(obj):
     matrix = np.array(obj.matrix_world.to_3x3(), dtype=np.float64)
     if abs(np.linalg.det(matrix)) < 1e-12:
-        raise TransferError(f"У «{obj.name}» нулевой масштаб, нормали не посчитать")
+        raise TransferError(f"{obj.name} has zero scale, so normals cannot be calculated")
     return matrix
 
 
@@ -78,7 +78,7 @@ def _corner_normals_world(obj, mesh):
     if loop_count == 0 or len(mesh.corner_normals) != loop_count:
         mesh.update()
     if loop_count == 0 or len(mesh.corner_normals) != loop_count:
-        raise TransferError(f"У «{obj.name}» нет нормалей по углам граней")
+        raise TransferError(f"{obj.name} has no corner normals")
     # Normals ignore translation and transform by the inverse transpose.
     local = _foreach_vec(mesh.corner_normals, "vector", loop_count)
     world = local @ np.linalg.inv(_linear_matrix(obj))
@@ -120,17 +120,17 @@ def _boundary_edges(mesh):
 def _target_mask(target, mesh, mode, vertex_group):
     vertex_count = len(mesh.vertices)
     if vertex_count == 0:
-        raise TransferError("У цели нет вершин")
+        raise TransferError("The target has no vertices")
     if mode == "SELECTED":
         selected = np.empty(vertex_count, dtype=np.bool_)
         mesh.vertices.foreach_get("select", selected)
         if not selected.any():
-            raise TransferError("Нет выделенных вершин. Выдели шов в Edit Mode и вернись в Object Mode")
+            raise TransferError("No vertices are selected. Select the seam in Edit Mode, then return to Object Mode")
         return selected
     if mode == "BOUNDARY":
         edges = _boundary_edges(mesh)
         if len(edges) == 0:
-            raise TransferError("На цели нет открытых рёбер")
+            raise TransferError("The target has no open edges")
         mask = np.zeros(vertex_count, dtype=bool)
         mask[edges[:, 0]] = True
         mask[edges[:, 1]] = True
@@ -138,7 +138,7 @@ def _target_mask(target, mesh, mode, vertex_group):
     if mode == "GROUP":
         group = target.vertex_groups.get(vertex_group) if vertex_group else None
         if group is None:
-            raise TransferError("Укажи группу вершин на цели")
+            raise TransferError("Pick a vertex group on the target")
         mask = np.zeros(vertex_count, dtype=bool)
         group_index = group.index
         for vertex in mesh.vertices:
@@ -147,9 +147,9 @@ def _target_mask(target, mesh, mode, vertex_group):
                     mask[vertex.index] = True
                     break
         if not mask.any():
-            raise TransferError("В группе нет вершин с весом")
+            raise TransferError("The group has no vertices with weight")
         return mask
-    raise TransferError(f"Неизвестный режим: {mode}")
+    raise TransferError(f"Unknown mode: {mode}")
 
 
 def _match_nearest(source_pos, source_normals, source_valid, target_pos, target_index, distance):
@@ -242,7 +242,7 @@ def _read_source(context, source):
         normals = _vertex_normals(loop_verts, corner_world, vertex_count)
         valid = np.linalg.norm(normals, axis=1) > _EXACT
         if not valid.any():
-            raise TransferError("У источника нет нормалей")
+            raise TransferError("The source has no normals")
         return {
             "positions": _world_positions(evaluated, mesh),
             "normals": normals,
@@ -261,7 +261,7 @@ def _world_to_local(obj, world_normals):
 def _apply_normals(mesh, local_normals, write_mask):
     loop_count = len(mesh.loops)
     if loop_count == 0:
-        raise TransferError("У цели нет граней")
+        raise TransferError("The target has no faces")
     # A zero vector tells Blender to keep the computed normal for that corner.
     # Existing custom normals are real vectors, so they have to be written back.
     if mesh.has_custom_normals and len(mesh.corner_normals) == loop_count:
@@ -274,27 +274,27 @@ def _apply_normals(mesh, local_normals, write_mask):
     try:
         mesh.normals_split_custom_set(normals.tolist())
     except RuntimeError as exc:
-        raise TransferError(f"Не удалось записать нормали: {exc}") from exc
+        raise TransferError(f"Could not write normals: {exc}") from exc
 
 
 def transfer_seam_normals(context, source, target, *, distance, mode, vertex_group="", interpolate=False):
     if source is None or target is None:
-        raise TransferError("Нужны два меша")
+        raise TransferError("Two meshes are required")
     if source.type != "MESH" or target.type != "MESH":
-        raise TransferError("Нужны два меша")
+        raise TransferError("Two meshes are required")
     if source == target:
-        raise TransferError("Источник и цель — один и тот же объект")
+        raise TransferError("The source and the target are the same object")
     if source.mode != "OBJECT" or target.mode != "OBJECT":
-        raise TransferError("Оба объекта должны быть в объектном режиме")
+        raise TransferError("Both objects must be in Object Mode")
 
     mesh = target.data
     mask = _target_mask(target, mesh, mode, vertex_group)
     if len(mesh.loops) == 0:
-        raise TransferError("У цели нет граней")
+        raise TransferError("The target has no faces")
 
     notes = []
     if mode == "SELECTED" and bool(mask.all()):
-        notes.append("выделены все вершины, проверь что это шов, а не весь меш")
+        notes.append("every vertex is selected; check that this is the seam, not the whole mesh")
 
     source_data = _read_source(context, source)
     target_pos = _world_positions(target, mesh)
@@ -311,7 +311,7 @@ def transfer_seam_normals(context, source, target, *, distance, mode, vertex_gro
             distance,
         )
         if matched is None:
-            notes.append("у источника нет открытых рёбер, взяты ближайшие вершины")
+            notes.append("the source has no open edges, so the nearest vertices were used")
             matched = _match_nearest(
                 source_data["positions"],
                 source_data["normals"],
@@ -348,24 +348,24 @@ def _resolve_source(context, source_name, target):
     if source_name:
         source = bpy.data.objects.get(source_name)
         if source is None or source.type != "MESH":
-            raise TransferError("Источник не найден")
+            raise TransferError("Source not found")
         return source
     others = [obj for obj in context.selected_objects if obj.type == "MESH" and obj != target]
     if len(others) == 1:
         return others[0]
-    raise TransferError("Укажи источник в панели или выдели ровно два меша")
+    raise TransferError("Set a source in the panel, or select exactly two meshes")
 
 
 class TransferSeamNormalsSettings(bpy.types.PropertyGroup):
     source: PointerProperty(
-        name="Источник",
-        description="Меш, с которого копируются нормали. Если пусто — берётся второй выделенный меш",
+        name="Source",
+        description="Mesh to copy normals from. If empty, the other selected mesh is used",
         type=bpy.types.Object,
         poll=_poll_mesh_object,
     )
     distance: FloatProperty(
-        name="Дистанция",
-        description="Максимальное расстояние в мире между вершиной цели и парой на источнике",
+        name="Distance",
+        description="Maximum world distance between a target vertex and its match on the source",
         default=0.001,
         min=0.0,
         soft_max=1.0,
@@ -373,39 +373,39 @@ class TransferSeamNormalsSettings(bpy.types.PropertyGroup):
         subtype="DISTANCE",
     )
     mode: EnumProperty(
-        name="Область",
-        description="Какие вершины цели менять",
+        name="Affect",
+        description="Which target vertices to change",
         items=MODE_ITEMS,
         default="SELECTED",
     )
     vertex_group: StringProperty(
-        name="Группа",
-        description="Группа вершин на цели",
+        name="Group",
+        description="Vertex group on the target",
     )
     interpolate: BoolProperty(
-        name="Интерполяция по ребру границы",
-        description="Брать нормаль с ближайшего открытого ребра источника. Нужно, если на новом шве вершин больше",
+        name="Interpolate Along Boundary",
+        description="Sample the nearest open edge on the source. Use this when the new seam has more vertices",
         default=False,
     )
 
 
 class OBJECT_OT_transfer_seam_normals(bpy.types.Operator):
     bl_idname = "object.transfer_seam_normals"
-    bl_label = "Перенести нормали шва"
-    bl_description = "Копирует нормали с источника на вершины шва активного меша"
+    bl_label = "Transfer Seam Normals"
+    bl_description = "Copy normals from the source onto the seam vertices of the active mesh"
     bl_options = {"REGISTER", "UNDO"}
 
     distance: FloatProperty(
-        name="Дистанция",
+        name="Distance",
         default=0.001,
         min=0.0,
         soft_max=1.0,
         precision=4,
         subtype="DISTANCE",
     )
-    mode: EnumProperty(name="Область", items=MODE_ITEMS, default="SELECTED")
-    vertex_group: StringProperty(name="Группа")
-    interpolate: BoolProperty(name="Интерполяция по ребру границы", default=False)
+    mode: EnumProperty(name="Affect", items=MODE_ITEMS, default="SELECTED")
+    vertex_group: StringProperty(name="Group")
+    interpolate: BoolProperty(name="Interpolate Along Boundary", default=False)
     source_name: StringProperty(options={"HIDDEN"})
 
     @classmethod
@@ -440,13 +440,13 @@ class OBJECT_OT_transfer_seam_normals(bpy.types.Operator):
             return {"CANCELLED"}
 
         if result.matched == 0:
-            message = "Ни одна вершина не попала в дистанцию"
+            message = "No vertex fell within the distance"
             if result.notes:
                 message = f"{message}. {'. '.join(result.notes)}"
             self.report({"WARNING"}, message)
             return {"CANCELLED"}
 
-        message = f"Перенесено вершин: {result.matched} из {result.matched + result.missed}"
+        message = f"Transferred vertices: {result.matched} of {result.matched + result.missed}"
         if result.notes:
             message = f"{message}. {'. '.join(result.notes)}"
         level = "WARNING" if result.missed or result.notes else "INFO"
@@ -455,7 +455,7 @@ class OBJECT_OT_transfer_seam_normals(bpy.types.Operator):
 
 
 class VIEW3D_PT_transfer_seam_normals(bpy.types.Panel):
-    bl_label = "Нормали шва"
+    bl_label = "Seam Normals"
     bl_idname = "VIEW3D_PT_transfer_seam_normals"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -464,21 +464,21 @@ class VIEW3D_PT_transfer_seam_normals(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         if context.mode != "OBJECT":
-            layout.label(text="Нужен объектный режим")
+            layout.label(text="Object Mode is required")
             return
 
         settings = context.scene.work_tools_seam_normals
         target = context.active_object
         col = layout.column(align=True)
         if target is not None and target.type == "MESH":
-            col.label(text=f"Цель: {target.name}")
+            col.label(text=f"Target: {target.name}")
         else:
-            col.label(text="Цель — активный меш")
+            col.label(text="Target is the active mesh")
         col.prop(settings, "source")
         col.prop(settings, "distance")
         col.prop(settings, "mode")
         if settings.mode == "GROUP" and target is not None and target.type == "MESH":
-            col.prop_search(settings, "vertex_group", target, "vertex_groups", text="Группа")
+            col.prop_search(settings, "vertex_group", target, "vertex_groups", text="Group")
         col.prop(settings, "interpolate")
         col.separator()
         col.operator(OBJECT_OT_transfer_seam_normals.bl_idname, icon="NORMALS_VERTEX")
