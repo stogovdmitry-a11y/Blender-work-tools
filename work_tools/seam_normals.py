@@ -454,6 +454,27 @@ class OBJECT_OT_transfer_seam_normals(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class OBJECT_OT_toggle_split_normals(bpy.types.Operator):
+    bl_idname = "object.toggle_split_normals"
+    bl_label = "Split Normals"
+    bl_description = "Show or hide custom split normals in this 3D Viewport"
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context):
+        return context.space_data is not None and context.space_data.type == "VIEW_3D"
+
+    def execute(self, context):
+        overlay = context.space_data.overlay
+        enabled = not overlay.show_split_normals
+        overlay.show_split_normals = enabled
+        if enabled:
+            overlay.show_overlays = True
+            if not overlay.use_normals_constant_screen_size and overlay.normals_length <= 0.0:
+                overlay.normals_length = 0.1
+        return {"FINISHED"}
+
+
 class VIEW3D_PT_transfer_seam_normals(bpy.types.Panel):
     bl_label = "Seam Normals"
     bl_idname = "VIEW3D_PT_transfer_seam_normals"
@@ -463,6 +484,17 @@ class VIEW3D_PT_transfer_seam_normals(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
+        overlay = context.space_data.overlay
+        row = layout.row(align=True)
+        row.operator(
+            OBJECT_OT_toggle_split_normals.bl_idname,
+            icon="NORMALS_VERTEX_FACE",
+            depress=overlay.show_split_normals,
+        )
+        if overlay.use_normals_constant_screen_size:
+            row.prop(overlay, "normals_constant_screen_size", text="Length")
+        else:
+            row.prop(overlay, "normals_length", text="Length")
         if context.mode != "OBJECT":
             layout.label(text="Object Mode is required")
             return
@@ -491,6 +523,7 @@ def draw_object_menu(layout):
 _CLASSES = (
     TransferSeamNormalsSettings,
     OBJECT_OT_transfer_seam_normals,
+    OBJECT_OT_toggle_split_normals,
     VIEW3D_PT_transfer_seam_normals,
 )
 
