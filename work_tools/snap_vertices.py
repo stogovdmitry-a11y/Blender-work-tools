@@ -17,20 +17,14 @@ class SnapVertexError(Exception):
     """User-facing snap failure. The message is shown in the status bar."""
 
 
-def _poll_mesh_object(self, obj):
-    return obj.type == "MESH"
-
-
-def _resolve_source(context, source_name, target):
-    if source_name:
-        source = bpy.data.objects.get(source_name)
-        if source is None or source.type != "MESH":
-            raise SnapVertexError("Source not found")
-        return source
-    others = [obj for obj in context.selected_objects if obj.type == "MESH" and obj != target]
-    if len(others) == 1:
-        return others[0]
-    raise SnapVertexError("Set a source in the panel, or select exactly two meshes")
+def _resolve_source(context, target):
+    selected = list(context.selected_objects)
+    if target is None or target.type != "MESH" or target not in selected or len(selected) != 2:
+        raise SnapVertexError("Select two meshes. The active one is the target")
+    source = selected[0] if selected[1] == target else selected[1]
+    if source.type != "MESH" or source == target:
+        raise SnapVertexError("Select two meshes. The active one is the target")
+    return source
 
 
 def _world_matrix(obj):
@@ -119,12 +113,6 @@ def snap_vertices(source, target, distance):
 
 
 class SnapVertexSettings(bpy.types.PropertyGroup):
-    source: PointerProperty(
-        name="Source",
-        description="Mesh used for both the snap and the normal transfer. If empty, the other selected mesh is used",
-        type=bpy.types.Object,
-        poll=_poll_mesh_object,
-    )
     distance: FloatProperty(
         name="Distance",
         description="Maximum world distance for the snap and for the normal transfer",
@@ -163,7 +151,6 @@ def _load_settings(operator, context):
     operator.mode = settings.mode
     operator.vertex_group = settings.vertex_group
     operator.interpolate = settings.interpolate
-    operator.source_name = settings.source.name if settings.source else ""
 
 
 def _run_snap_seams(operator, context, action):
@@ -175,7 +162,7 @@ def _run_snap_seams(operator, context, action):
     snap_missed = 0
     result = None
     try:
-        source = _resolve_source(context, operator.source_name, target)
+        source = _resolve_source(context, target)
         if action == "SNAP" or operator.do_both:
             snapped, snap_missed = snap_vertices(source, target, operator.distance)
             context.view_layer.update()
@@ -232,7 +219,6 @@ class OBJECT_OT_snap_vertices(bpy.types.Operator):
     mode: EnumProperty(name="Affect", items=MODE_ITEMS, default="SELECTED")
     vertex_group: StringProperty(name="Group")
     interpolate: BoolProperty(name="Interpolate Along Boundary", default=False)
-    source_name: StringProperty(options={"HIDDEN"})
 
     @classmethod
     def poll(cls, context):
@@ -258,7 +244,6 @@ class OBJECT_OT_transfer_seam_normals(bpy.types.Operator):
     mode: EnumProperty(name="Affect", items=MODE_ITEMS, default="SELECTED")
     vertex_group: StringProperty(name="Group")
     interpolate: BoolProperty(name="Interpolate Along Boundary", default=False)
-    source_name: StringProperty(options={"HIDDEN"})
 
     @classmethod
     def poll(cls, context):
@@ -309,7 +294,14 @@ class VIEW3D_PT_snap_seams(bpy.types.Panel):
             col.label(text=f"Target: {target.name}")
         else:
             col.label(text="Target is the active mesh")
-        col.prop(settings, "source")
+        try:
+            source = _resolve_source(context, target)
+        except SnapVertexError:
+            source = None
+        if source is not None:
+            col.label(text=f"Source: {source.name}")
+        else:
+            col.label(text="Select one other mesh as the source")
         col.prop(settings, "distance")
         col.prop(settings, "mode")
         if settings.mode == "GROUP" and target is not None and target.type == "MESH":

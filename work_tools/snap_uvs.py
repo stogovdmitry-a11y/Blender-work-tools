@@ -1,14 +1,13 @@
 """Snap UV points on the active mesh to the nearest UV points of a source.
 
 Only points inside the distance move. The rest of the UV map stays put.
-The active mesh is the target. The source is chosen in the panel, or taken
-as the other selected mesh.
+The active mesh is the target. The other selected mesh is the source.
 """
 
 import bpy
 import bmesh
 import numpy as np
-from bpy.props import BoolProperty, FloatProperty, PointerProperty, StringProperty
+from bpy.props import BoolProperty, FloatProperty, PointerProperty
 from mathutils.kdtree import KDTree
 
 
@@ -16,20 +15,14 @@ class SnapUVError(Exception):
     """User-facing snap failure. The message is shown in the status bar."""
 
 
-def _poll_mesh_object(self, obj):
-    return obj.type == "MESH"
-
-
-def _resolve_source(context, source_name, target):
-    if source_name:
-        source = bpy.data.objects.get(source_name)
-        if source is None or source.type != "MESH":
-            raise SnapUVError("Source not found")
-        return source
-    others = [obj for obj in context.selected_objects if obj.type == "MESH" and obj != target]
-    if len(others) == 1:
-        return others[0]
-    raise SnapUVError("Set a source in the panel, or select exactly two meshes")
+def _resolve_source(context, target):
+    selected = list(context.selected_objects)
+    if target is None or target.type != "MESH" or target not in selected or len(selected) != 2:
+        raise SnapUVError("Select two meshes. The active one is the target")
+    source = selected[0] if selected[1] == target else selected[1]
+    if source.type != "MESH" or source == target:
+        raise SnapUVError("Select two meshes. The active one is the target")
+    return source
 
 
 def _read_uvs(obj):
@@ -129,7 +122,14 @@ def _draw_snap_uvs(layout, context):
         col.label(text=f"Target: {target.name}")
     else:
         col.label(text="Target is the active mesh")
-    col.prop(settings, "source")
+    try:
+        source = _resolve_source(context, target)
+    except SnapUVError:
+        source = None
+    if source is not None:
+        col.label(text=f"Source: {source.name}")
+    else:
+        col.label(text="Select one other mesh as the source")
     col.prop(settings, "distance")
     col.prop(settings, "selected_only")
     col.separator()
@@ -137,12 +137,6 @@ def _draw_snap_uvs(layout, context):
 
 
 class SnapUVSettings(bpy.types.PropertyGroup):
-    source: PointerProperty(
-        name="Source",
-        description="Mesh whose UV points are the snap targets. If empty, the other selected mesh is used",
-        type=bpy.types.Object,
-        poll=_poll_mesh_object,
-    )
     distance: FloatProperty(
         name="Distance",
         description="Maximum distance in UV space. Points farther than this stay where they are",
@@ -166,7 +160,6 @@ class UV_OT_snap_uv_points(bpy.types.Operator):
 
     distance: FloatProperty(name="Distance", default=0.001, min=0.0, soft_max=0.1, precision=4)
     selected_only: BoolProperty(name="Selected Only", default=False)
-    source_name: StringProperty(options={"HIDDEN"})
 
     @classmethod
     def poll(cls, context):
@@ -177,13 +170,12 @@ class UV_OT_snap_uv_points(bpy.types.Operator):
         settings = context.scene.work_tools_snap_uvs
         self.distance = settings.distance
         self.selected_only = settings.selected_only
-        self.source_name = settings.source.name if settings.source else ""
         return self.execute(context)
 
     def execute(self, context):
         target = context.active_object
         try:
-            source = _resolve_source(context, self.source_name, target)
+            source = _resolve_source(context, target)
             snapped, missed = snap_uv_points(source, target, self.distance, self.selected_only)
         except SnapUVError as exc:
             self.report({"WARNING"}, str(exc))
