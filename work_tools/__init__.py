@@ -7,7 +7,7 @@ the menu below. Panels go in the Work Tools sidebar tab.
 bl_info = {
     "name": "Work Tools",
     "author": "",
-    "version": (1, 0, 0),
+    "version": (1, 1, 2),
     "blender": (4, 5, 0),
     "location": "View3D > Sidebar > Work Tools",
     "description": "A set of working tools for Blender",
