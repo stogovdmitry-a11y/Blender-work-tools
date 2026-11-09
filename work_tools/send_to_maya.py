@@ -18,6 +18,8 @@ import bpy
 import numpy as np
 from bpy.props import BoolProperty, IntProperty, PointerProperty
 
+from .check_mesh import _report_lines, _select_problems, check_mesh
+
 PORT_COMMAND = (
     "import maya.cmds as cmds\n"
     "cmds.commandPort(name=\"127.0.0.1:4434\", sourceType=\"python\")"
@@ -172,13 +174,34 @@ def _restore_matrices(saved):
         obj.matrix_world = matrix
 
 
-def export_fbx(context, meshes, filepath, apply_modifiers, apply_transforms, zero_location):
+def _clear_materials(objects):
+    saved = []
+    seen = set()
+    for obj in objects:
+        mesh = obj.data
+        if mesh is None or mesh in seen:
+            continue
+        seen.add(mesh)
+        saved.append((mesh, list(mesh.materials)))
+        mesh.materials.clear()
+    return saved
+
+
+def _restore_materials(saved):
+    for mesh, materials in saved:
+        mesh.materials.clear()
+        for material in materials:
+            mesh.materials.append(material)
+
+
+def export_fbx(context, meshes, filepath, apply_modifiers, apply_transforms, zero_location, remove_materials):
     ensure_fbx_exporter()
     view_layer = context.view_layer
     previous = list(context.selected_objects)
     active = view_layer.objects.active
     copies = []
     saved_matrices = []
+    saved_materials = []
     try:
         if zero_location:
             saved_matrices = _zero_world_locations(meshes)
@@ -189,6 +212,13 @@ def export_fbx(context, meshes, filepath, apply_modifiers, apply_transforms, zer
             copies = _copies_with_applied_transforms(context, meshes, apply_modifiers)
             targets = copies
             modifiers = False
+        if remove_materials:
+            if copies:
+                for obj in copies:
+                    if obj.data is not None:
+                        obj.data.materials.clear()
+            else:
+                saved_materials = _clear_materials(targets)
         for obj in view_layer.objects:
             obj.select_set(obj in targets)
         view_layer.objects.active = targets[0]
@@ -221,6 +251,8 @@ def export_fbx(context, meshes, filepath, apply_modifiers, apply_transforms, zer
             obj.select_set(obj in previous)
         view_layer.objects.active = active
         _delete_objects(copies)
+        if saved_materials:
+            _restore_materials(saved_materials)
         if saved_matrices:
             _restore_matrices(saved_matrices)
             view_layer.update()
@@ -255,13 +287,41 @@ def material_snapshot():
         set(cmds.ls(type=("file", "place2dTexture")) or []),
     )
 
+def assign_shading_engine(shape, engine):
+    import maya.cmds as cmds
+    if not shape or not engine or not cmds.objExists(shape) or not cmds.objExists(engine):
+        return
+    # sets() prints an exclusivity error when a shape and its faces sit in
+    # different shading groups. Rewire the shading plugs instead.
+    plugs = cmds.listConnections(
+        shape,
+        type="shadingEngine",
+        plugs=True,
+        connections=True,
+        source=False,
+        destination=True,
+    ) or []
+    for src, dst in zip(plugs[0::2], plugs[1::2]):
+        if dst.split(".")[0] == engine and ".objectGroups[" not in src:
+            continue
+        try:
+            cmds.disconnectAttr(src, dst)
+        except Exception:
+            pass
+    source_plug = shape + ".instObjGroups[0]"
+    if engine not in (cmds.listConnections(source_plug, type="shadingEngine") or []):
+        try:
+            cmds.connectAttr(source_plug, engine + ".dagSetMembers", nextAvailable=True)
+        except Exception:
+            pass
+
 def discard_imported_materials(snapshot, transforms):
     import maya.cmds as cmds
     old_materials, old_engines, old_files = snapshot
     for transform in transforms:
         for shape in cmds.listRelatives(transform, shapes=True, fullPath=True, type="mesh") or []:
             try:
-                cmds.sets(shape, edit=True, forceElement="initialShadingGroup")
+                assign_shading_engine(shape, "initialShadingGroup")
             except Exception:
                 pass
     for engine in cmds.ls(type="shadingEngine") or []:
@@ -328,7 +388,7 @@ def adopt_shape(shape, item, existing):
             pass
     for engine in engines:
         try:
-            cmds.sets(moved, edit=True, forceElement=engine)
+            assign_shading_engine(moved, engine)
         except Exception:
             pass
     children = cmds.listRelatives(new_parent, children=True) or []
@@ -566,7 +626,7 @@ def prepare_send(context, apply_modifiers, apply_transforms, zero_location, remo
     fbx_path = fbx_handle.name
     fbx_handle.close()
     try:
-        export_fbx(context, meshes, fbx_path, apply_modifiers, apply_transforms, zero_location)
+        export_fbx(context, meshes, fbx_path, apply_modifiers, apply_transforms, zero_location, remove_materials)
         script_path, result_path = write_maya_script(fbx_path, payload, remove_materials)
     except Exception:
         cleanup_send(fbx_path, None, None)
@@ -626,6 +686,11 @@ class WorkToolsMayaSettings(bpy.types.PropertyGroup):
         description="Do not send materials to Maya. Materials on the Blender object stay. A material already on the Maya object is kept when updating",
         default=True,
     )
+    check_mesh: BoolProperty(
+        name="Check Mesh",
+        description="Run Check Mesh before sending. Unwelded vertices, extra UV channels, or n-gons cancel the send",
+        default=True,
+    )
 
 
 class OBJECT_OT_send_to_maya(bpy.types.Operator):
@@ -645,6 +710,8 @@ class OBJECT_OT_send_to_maya(bpy.types.Operator):
             self.report({"WARNING"}, "Already sending to Maya")
             return {"CANCELLED"}
         settings = context.scene.work_tools_maya
+        if settings.check_mesh and self._block_on_mesh_problems(context):
+            return {"CANCELLED"}
         try:
             fbx_path, script_path, result_path = prepare_send(
                 context,
@@ -674,6 +741,29 @@ class OBJECT_OT_send_to_maya(bpy.types.Operator):
         window_manager.modal_handler_add(self)
         self._set_status(context, "Sending to Maya...")
         return {"RUNNING_MODAL"}
+
+    def _block_on_mesh_problems(self, context):
+        reports = []
+        first_bad = None
+        first_found = None
+        for obj in selected_meshes(context):
+            found = check_mesh(obj)
+            lines = _report_lines(found)
+            if not lines:
+                continue
+            if first_bad is None:
+                first_bad = obj
+                first_found = found
+            reports.append(f"{obj.name}: {', '.join(lines)}")
+        if not reports:
+            return False
+        context.view_layer.objects.active = first_bad
+        if first_found["unwelded"] or first_found["ngons"]:
+            _select_problems(context, first_bad, first_found["unwelded"], first_found["ngons"])
+        text = "\n".join(reports)
+        context.scene.work_tools_check_mesh.report = text
+        self.report({"WARNING"}, text.replace("\n", ". "))
+        return True
 
     def modal(self, context, event):
         if event.type == "ESC" and event.value == "PRESS":
@@ -755,6 +845,7 @@ class VIEW3D_PT_send_to_maya(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "Work Tools"
+    bl_order = 4
 
     def draw(self, context):
         layout = self.layout
@@ -768,6 +859,7 @@ class VIEW3D_PT_send_to_maya(bpy.types.Panel):
         col.prop(settings, "apply_transforms")
         col.prop(settings, "zero_location")
         col.prop(settings, "remove_materials")
+        col.prop(settings, "check_mesh")
         col.operator(OBJECT_OT_copy_maya_port_command.bl_idname, icon="COPYDOWN")
         col.separator()
         col.operator(OBJECT_OT_send_to_maya.bl_idname, icon="EXPORT")

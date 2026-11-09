@@ -1,8 +1,8 @@
-"""Shrinkwrap the other selected mesh onto the active one and apply it.
+"""Shrinkwrap the active mesh onto the other selected one and apply it.
 
-Select two meshes. The active one stays put: it is the target. The other
-mesh is the source, and it is the one that moves. There is no source picker.
-An optional vertex group on the source limits which of its vertices move.
+Select two meshes. The second one, the active mesh, is the target and it
+moves. The first one is the source and stays put. A vertex group on the
+target limits which of its vertices move.
 """
 
 import bpy
@@ -25,45 +25,39 @@ def _other_selected(context, target):
     return source
 
 
-def apply_shrinkwrap(context, source, target, vertex_group=""):
-    if vertex_group and vertex_group not in source.vertex_groups:
-        raise ShrinkwrapError(f"Vertex group '{vertex_group}' was not found on {source.name}")
+def apply_shrinkwrap(context, target, source, vertex_group=""):
+    if vertex_group and vertex_group not in target.vertex_groups:
+        raise ShrinkwrapError(f"Vertex group '{vertex_group}' was not found on {target.name}")
 
-    modifier = source.modifiers.new(name="Shrinkwrap", type="SHRINKWRAP")
-    modifier.target = target
+    modifier = target.modifiers.new(name="Shrinkwrap", type="SHRINKWRAP")
+    modifier.target = source
     modifier.wrap_method = "NEAREST_SURFACEPOINT"
     if vertex_group:
         modifier.vertex_group = vertex_group
-
-    view_layer = context.view_layer
-    previous_active = view_layer.objects.active
     try:
-        view_layer.objects.active = source
-        try:
+        with context.temp_override(active_object=target, object=target):
             result = bpy.ops.object.modifier_apply(modifier=modifier.name)
-        except RuntimeError as exc:
-            if modifier.name in source.modifiers:
-                source.modifiers.remove(modifier)
-            raise ShrinkwrapError(str(exc)) from exc
-    finally:
-        view_layer.objects.active = previous_active
+    except RuntimeError as exc:
+        if modifier.name in target.modifiers:
+            target.modifiers.remove(modifier)
+        raise ShrinkwrapError(str(exc)) from exc
     if "FINISHED" not in result:
-        if modifier.name in source.modifiers:
-            source.modifiers.remove(modifier)
+        if modifier.name in target.modifiers:
+            target.modifiers.remove(modifier)
         raise ShrinkwrapError("Could not apply the Shrinkwrap modifier")
 
 
 class ShrinkwrapSettings(bpy.types.PropertyGroup):
     vertex_group: StringProperty(
         name="Group",
-        description="Vertex group on the source mesh. Empty shrinkwraps the whole source",
+        description="Vertex group on the target. Empty shrinkwraps the whole target",
     )
 
 
 class OBJECT_OT_apply_shrinkwrap(bpy.types.Operator):
     bl_idname = "object.apply_work_tools_shrinkwrap"
     bl_label = "Apply Shrinkwrap"
-    bl_description = "Shrinkwrap the other selected mesh onto the active mesh and apply the modifier"
+    bl_description = "Shrinkwrap the active mesh onto the other selected mesh and apply the modifier"
     bl_options = {"REGISTER", "UNDO"}
 
     vertex_group: StringProperty(name="Group")
@@ -81,12 +75,12 @@ class OBJECT_OT_apply_shrinkwrap(bpy.types.Operator):
         target = context.active_object
         try:
             source = _other_selected(context, target)
-            apply_shrinkwrap(context, source, target, self.vertex_group)
+            apply_shrinkwrap(context, target, source, self.vertex_group)
         except ShrinkwrapError as exc:
             self.report({"WARNING"}, str(exc))
             return {"CANCELLED"}
         group = f" in '{self.vertex_group}'" if self.vertex_group else ""
-        self.report({"INFO"}, f"Shrinkwrapped {source.name}{group} onto {target.name}")
+        self.report({"INFO"}, f"Shrinkwrapped {target.name}{group} onto {source.name}")
         return {"FINISHED"}
 
 
@@ -96,6 +90,7 @@ class VIEW3D_PT_shrinkwrap(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "Work Tools"
+    bl_order = 0
 
     def draw(self, context):
         layout = self.layout
@@ -110,12 +105,11 @@ class VIEW3D_PT_shrinkwrap(bpy.types.Panel):
             col.prop(settings, "vertex_group", text="Group")
         else:
             col.label(text=f"Target: {target.name}")
+            col.prop_search(settings, "vertex_group", target, "vertex_groups", text="Group")
             others = [obj for obj in context.selected_objects if obj != target and obj.type == "MESH"]
-            if len(others) == 1:
+            if len(context.selected_objects) == 2 and len(others) == 1:
                 col.label(text=f"Source: {others[0].name}")
-                col.prop_search(settings, "vertex_group", others[0], "vertex_groups", text="Group")
             else:
-                col.prop_search(settings, "vertex_group", target, "vertex_groups", text="Group")
                 col.label(text="Select one other mesh as the source")
         col.operator(OBJECT_OT_apply_shrinkwrap.bl_idname, icon="MOD_SHRINKWRAP")
 

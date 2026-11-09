@@ -194,6 +194,7 @@ class VIEW3D_PT_snap_uvs(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "Work Tools"
+    bl_order = 1
 
     def draw(self, context):
         layout = self.layout
