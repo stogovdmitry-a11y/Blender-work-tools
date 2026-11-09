@@ -231,6 +231,7 @@ def export_fbx(context, meshes, filepath, apply_modifiers, apply_transforms, zer
                         obj.data.materials.clear()
             else:
                 saved_materials = _clear_materials(targets)
+            view_layer.update()
         for obj in view_layer.objects:
             obj.select_set(obj in targets)
         view_layer.objects.active = targets[0]
@@ -293,11 +294,35 @@ def leaf_name(node):
 
 def material_snapshot():
     import maya.cmds as cmds
-    return (
-        set(cmds.ls(materials=True) or []),
-        set(cmds.ls(type="shadingEngine") or []),
-        set(cmds.ls(type=("file", "place2dTexture")) or []),
-    )
+    materials = set()
+    for node in cmds.ls(materials=True, long=True) or []:
+        uid = _uuid(node)
+        if uid:
+            materials.add(uid)
+    engines = {}
+    for engine in cmds.ls(type="shadingEngine", long=True) or []:
+        uid = _uuid(engine)
+        if not uid:
+            continue
+        plugs = cmds.listConnections(
+            engine + ".surfaceShader",
+            source=True,
+            destination=False,
+            plugs=True,
+        ) or []
+        source = None
+        if plugs:
+            plug = plugs[0]
+            src_uid = _uuid(plug.split(".")[0])
+            if src_uid:
+                source = (src_uid, plug.split(".", 1)[1])
+        engines[uid] = source
+    files = set()
+    for node in cmds.ls(type=("file", "place2dTexture", "materialInfo"), long=True) or []:
+        uid = _uuid(node)
+        if uid:
+            files.add(uid)
+    return materials, engines, files
 
 def assign_shading_engine(shape, engine):
     import maya.cmds as cmds
@@ -390,63 +415,121 @@ def reuse_existing_materials(shape, wanted, old_names):
         except Exception:
             assign_shading_engine(shape, target)
             changed = True
+    if not changed and existing:
+        engine = engine_of_material(existing[0])
+        if engine:
+            assign_shading_engine(shape, engine)
+            return True
     return changed
 
-def delete_renamed_materials(wanted, old_names, old_materials, old_engines):
+def _uuid(node):
     import maya.cmds as cmds
-    for material in cmds.ls(materials=True) or []:
-        if material in old_materials:
-            continue
-        short = material.split("|")[-1].split(":")[-1]
-        duplicate = False
-        for name in wanted:
-            if name in old_names and is_renamed_copy(short, name):
-                duplicate = True
-                break
-        if not duplicate:
-            continue
-        engines = cmds.listConnections(material, type="shadingEngine") or []
-        try:
-            cmds.delete(material)
-        except Exception:
-            pass
-        for engine in engines:
-            if engine in old_engines or engine == "initialShadingGroup" or not cmds.objExists(engine):
-                continue
-            members = cmds.sets(engine, query=True) or []
-            if not members:
-                try:
-                    cmds.delete(engine)
-                except Exception:
-                    pass
+    found = cmds.ls(node, uuid=True) or []
+    return found[0] if found else None
 
-def discard_imported_materials(snapshot, transforms):
+def _node_by_uuid(uid):
+    import maya.cmds as cmds
+    if not uid:
+        return None
+    found = cmds.ls(uid, long=True) or []
+    return found[0] if found else None
+
+def _delete_node(node):
+    import maya.cmds as cmds
+    if not node or not cmds.objExists(node):
+        return
+    try:
+        cmds.delete(node)
+        return
+    except Exception:
+        pass
+    plugs = cmds.listConnections(node, plugs=True, connections=True) or []
+    for src, dst in zip(plugs[0::2], plugs[1::2]):
+        try:
+            cmds.disconnectAttr(src, dst)
+        except Exception:
+            try:
+                cmds.disconnectAttr(dst, src)
+            except Exception:
+                pass
+    try:
+        cmds.delete(node)
+    except Exception:
+        pass
+
+def delete_new_shading(snapshot):
+    """Remove shading nodes the import created. Existing nodes are kept by UUID.
+
+    Maya renames an imported material when the name is taken, so comparing
+    names would delete the original and keep the copy.
+    """
     import maya.cmds as cmds
     old_materials, old_engines, old_files = snapshot
-    for transform in transforms:
-        for shape in cmds.listRelatives(transform, shapes=True, fullPath=True, type="mesh") or []:
-            try:
-                assign_shading_engine(shape, "initialShadingGroup")
-            except Exception:
-                pass
-    for engine in cmds.ls(type="shadingEngine") or []:
-        if engine not in old_engines and engine != "initialShadingGroup":
-            try:
-                cmds.delete(engine)
-            except Exception:
-                pass
-    for material in cmds.ls(materials=True) or []:
-        if material not in old_materials:
-            try:
-                cmds.delete(material)
-            except Exception:
-                pass
-    for node in cmds.ls(type=("file", "place2dTexture")) or []:
-        if node not in old_files:
-            try:
-                cmds.delete(node)
-            except Exception:
-                pass
+    for uid, source in old_engines.items():
+        engine = _node_by_uuid(uid)
+        if not engine or not source or not cmds.objExists(engine):
+            continue
+        src = _node_by_uuid(source[0])
+        if not src or not cmds.objExists(src):
+            continue
+        plug = src + "." + source[1]
+        current = cmds.listConnections(
+            engine + ".surfaceShader",
+            source=True,
+            destination=False,
+            plugs=True,
+        ) or []
+        if plug in current:
+            continue
+        try:
+            cmds.connectAttr(plug, engine + ".surfaceShader", force=True)
+        except Exception:
+            pass
+    for engine in list(cmds.ls(type="shadingEngine", long=True) or []):
+        uid = _uuid(engine)
+        if not uid or uid in old_engines or not cmds.objExists(engine):
+            continue
+        for shape in cmds.listConnections(engine, type="mesh") or []:
+            others = cmds.listConnections(shape, type="shadingEngine") or []
+            kept = None
+            for other in others:
+                other_uid = _uuid(other)
+                if other_uid in old_engines and leaf_name(other) != "initialShadingGroup":
+                    kept = other
+                    break
+            assign_shading_engine(shape, kept or "initialShadingGroup")
+        _delete_node(engine)
+    for material in list(cmds.ls(materials=True, long=True) or []):
+        uid = _uuid(material)
+        if uid and uid not in old_materials:
+            _delete_node(material)
+    for node in list(cmds.ls(type=("file", "place2dTexture", "materialInfo"), long=True) or []):
+        uid = _uuid(node)
+        if uid and uid not in old_files:
+            _delete_node(node)
+
+def fbx_bool(name, value):
+    import maya.mel as mel
+    previous = None
+    try:
+        previous = mel.eval(name + " -q")
+    except Exception:
+        return None
+    try:
+        mel.eval("%s -v %s" % (name, "true" if value else "false"))
+    except Exception:
+        return None
+    return previous
+
+def restore_fbx_bool(name, previous):
+    import maya.mel as mel
+    if previous is None:
+        return
+    enabled = previous not in (0, "0", False, "false", "False")
+    try:
+        mel.eval("%s -v %s" % (name, "true" if enabled else "false"))
+    except Exception:
+        pass
 
 def existing_transforms():
     found = {}
@@ -501,7 +584,7 @@ def adopt_shape(shape, item, existing):
         cmds.delete(new_parent)
     return old
 
-def run():
+def _send():
     import maya.cmds as cmds
     import maya.mel as mel
     import maya.api.OpenMaya as om
@@ -516,10 +599,8 @@ def run():
             pass
 
     already = existing_transforms()
+    old_material_names = set(leaf_name(node) for node in (cmds.ls(materials=True) or []))
     materials_before = material_snapshot()
-    old_material_names = set()
-    for material in materials_before[0]:
-        old_material_names.add(material.split("|")[-1].split(":")[-1])
     before = set(cmds.ls(long=True, type="mesh") or [])
     mel_try("FBXImportMode -v add")
     mel_try("FBXImportScaleFactor 1")
@@ -530,6 +611,8 @@ def run():
     mel_try("FBXImportConstraints -v false")
     mel_try("FBXImportCameras -v false")
     mel_try("FBXImportLights -v false")
+    mel_try("FBXImportMaterials -v false")
+    mel_try("FBXImportTextures -v false")
     mel.eval('FBXImport -f "%s"' % fbx_path.replace("\\", "/"))
     after = set(cmds.ls(long=True, type="mesh") or [])
     shapes = [shape for shape in after if shape not in before]
@@ -545,7 +628,6 @@ def run():
     restored = 0
     transforms = []
     fresh = []
-    reuse_names = []
     kept_transforms = []
     for item in payload:
         shape = None
@@ -588,7 +670,6 @@ def run():
                 transforms.append(parent)
                 fresh.append(parent)
         wanted = item.get("materials") or []
-        reuse_names.extend(wanted)
         shape_now = shape
         if adopted:
             relatives = cmds.listRelatives(adopted, shapes=True, fullPath=True, type="mesh") or []
@@ -598,18 +679,28 @@ def run():
             kept_transforms.append(transforms[-1])
         restored += 1
 
-    delete_renamed_materials(reuse_names, old_material_names, materials_before[0], materials_before[1])
-    if remove_materials:
-        discard_imported_materials(
-            materials_before,
-            [node for node in fresh if node not in kept_transforms],
-        )
+    for node in fresh:
+        if node in kept_transforms:
+            continue
+        for shape in cmds.listRelatives(node, shapes=True, fullPath=True, type="mesh") or []:
+            assign_shading_engine(shape, "initialShadingGroup")
+    delete_new_shading(materials_before)
     if transforms:
         cmds.select(transforms, replace=True)
     message = "OK %d" % restored
     if notes:
         message += "\n" + "\n".join(notes)
     return message
+
+def run():
+    saved = []
+    for name in ("FBXImportMaterials", "FBXImportTextures"):
+        saved.append((name, fbx_bool(name, False)))
+    try:
+        return _send()
+    finally:
+        for name, previous in saved:
+            restore_fbx_bool(name, previous)
 
 def restore_mesh(shape, item):
     import maya.api.OpenMaya as om
@@ -806,7 +897,7 @@ class WorkToolsMayaSettings(bpy.types.PropertyGroup):
     )
     remove_materials: BoolProperty(
         name="Remove Materials",
-        description="Do not send new materials to Maya. A material that is already in the scene, with the same name, is used instead",
+        description="Do not add Blender materials to the Maya scene. A material that is already there, with the same name, is used. Anything the import creates is deleted",
         default=True,
     )
     check_mesh: BoolProperty(

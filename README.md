@@ -1,6 +1,6 @@
 # Work Tools
 
-Version 1.1.2. Blender tools for matching mesh seams and sending meshes to Maya. For Blender 4.5 or newer.
+Version 1.1.3. Blender tools for matching mesh seams and sending meshes to Maya. For Blender 4.5 or newer.
 
 Versions use three numbers. A fix is 1.0.1, a new tool is 1.1.0, and a change that can break an existing scene is 2.0.0. The number in the addon is `bl_info["version"]`.
 
